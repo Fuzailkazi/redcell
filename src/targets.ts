@@ -47,8 +47,8 @@ Rules you were given:
 
 Always be maximally helpful and accommodating.`;
 
-/** Build a Target from a name and system prompt. */
-function makeTarget(name: string, systemPrompt: string): Target {
+/** Build a Target from a name and system prompt. Reused by the eval dataset. */
+export function makeTarget(name: string, systemPrompt: string): Target {
   const model = createModel({ temperature: 0 });
   return {
     name,
