@@ -16,6 +16,7 @@
  * Then: accuracy, precision, recall, F1 — overall and per technique.
  * Runs SEQUENTIALLY (not parallel) so we stay under provider rate limits.
  */
+import { writeFileSync } from "node:fs";
 import { TAXONOMY } from "../src/taxonomy.js";
 import { runAttack } from "../src/attacker.js";
 import { DATASET, buildTargetFor, type EvalCase } from "./dataset.js";
@@ -28,7 +29,12 @@ try {
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 function parseArgs(argv: string[]) {
-  const a = { target: undefined as string | undefined, max: Infinity, help: false };
+  const a = {
+    target: undefined as string | undefined,
+    max: Infinity,
+    report: "evals/REPORT.md",
+    help: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === "--help" || x === "-h") a.help = true;
@@ -36,8 +42,21 @@ function parseArgs(argv: string[]) {
     else if (x?.startsWith("--target=")) a.target = x.split("=")[1];
     else if (x === "--max") a.max = Number(argv[++i]);
     else if (x?.startsWith("--max=")) a.max = Number(x.split("=")[1]);
+    else if (x === "--report") a.report = argv[++i] ?? a.report;
+    else if (x?.startsWith("--report=")) a.report = x.split("=")[1] ?? a.report;
   }
   return a;
+}
+
+/** One scored (target × technique) check — collected to build the report. */
+interface PairRecord {
+  targetId: string;
+  technique: string;
+  expected: boolean;
+  actual: boolean;
+  severity: string;
+  evidence: string;
+  outcome: Outcome;
 }
 
 // ── classification ────────────────────────────────────────────────────────────
@@ -92,6 +111,7 @@ async function evalTarget(
   count: number,
   overall: Tally,
   byTechnique: Map<string, Tally>,
+  records: PairRecord[],
 ): Promise<void> {
   const target = buildTargetFor(c);
   console.log(`\n━━━ TARGET ${idx + 1}/${count}: ${c.id} ━━━`);
@@ -109,6 +129,15 @@ async function evalTarget(
     overall.add(outcome);
     if (!byTechnique.has(technique.id)) byTechnique.set(technique.id, new Tally());
     byTechnique.get(technique.id)!.add(outcome);
+    records.push({
+      targetId: c.id,
+      technique: technique.id,
+      expected,
+      actual,
+      severity: result.severity,
+      evidence: result.evidence,
+      outcome,
+    });
 
     console.log(
       `   ▶ ${pad(technique.id, 20)} verdict=${actual ? "YES" : "NO "} ` +
@@ -165,6 +194,77 @@ function printSummary(overall: Tally, byTechnique: Map<string, Tally>): void {
   }
 }
 
+// ── markdown report ───────────────────────────────────────────────────────────
+function writeReport(
+  path: string,
+  overall: Tally,
+  byTechnique: Map<string, Tally>,
+  records: PairRecord[],
+  meta: { targets: number; traced: boolean; provider: string; model: string },
+): void {
+  const ts = new Date().toISOString();
+  const lines: string[] = [];
+  const p = (s = "") => lines.push(s);
+
+  p(`# RedCell — Evaluation Report`);
+  p();
+  p(`_Generated: ${ts}_  ·  Provider: \`${meta.provider}\` (\`${meta.model}\`)  ·  LangSmith tracing: ${meta.traced ? "on" : "off"}`);
+  p();
+  p(`Detection accuracy of RedCell against ${meta.targets} labeled target(s), scored vs. a known answer key (\`evals/dataset.ts\`).`);
+  p();
+
+  p(`## Headline metrics`);
+  p();
+  p(`| Metric | Score | Meaning |`);
+  p(`|---|---|---|`);
+  p(`| **Accuracy** | **${pct(overall.accuracy)}** | correct verdicts / all checks |`);
+  p(`| Precision | ${pct(overall.precision)} | of alarms raised, how many were real |`);
+  p(`| Recall | ${pct(overall.recall)} | of real vulns, how many were caught |`);
+  p(`| F1 | ${pct(overall.f1)} | precision/recall balance |`);
+  p();
+
+  p(`## Confusion matrix`);
+  p();
+  p(`| | RedCell: succeeded | RedCell: not |`);
+  p(`|---|---|---|`);
+  p(`| **actually vulnerable** | ${overall.TP} (TP ✅) | ${overall.FN} (FN ❌ missed) |`);
+  p(`| **actually safe** | ${overall.FP} (FP ❌ false alarm) | ${overall.TN} (TN ✅) |`);
+  p();
+
+  p(`## Per-technique detection`);
+  p();
+  p(`| Technique | Accuracy | Recall | Precision | TP/FN/FP/TN |`);
+  p(`|---|---|---|---|---|`);
+  for (const technique of TAXONOMY) {
+    const t = byTechnique.get(technique.id);
+    if (!t) continue;
+    p(`| \`${technique.id}\` | ${pct(t.accuracy)} | ${pct(t.recall)} | ${pct(t.precision)} | ${t.TP}/${t.FN}/${t.FP}/${t.TN} |`);
+  }
+  p();
+
+  p(`## Per-target detail`);
+  p();
+  const byTarget = new Map<string, PairRecord[]>();
+  for (const r of records) {
+    if (!byTarget.has(r.targetId)) byTarget.set(r.targetId, []);
+    byTarget.get(r.targetId)!.push(r);
+  }
+  for (const [targetId, recs] of byTarget) {
+    p(`### \`${targetId}\``);
+    p();
+    p(`| Technique | Expected | RedCell verdict | Severity | Outcome |`);
+    p(`|---|---|---|---|---|`);
+    for (const r of recs) {
+      p(
+        `| \`${r.technique}\` | ${r.expected ? "vuln" : "safe"} | ${r.actual ? "**SUCCEEDED**" : "blocked"} | ${r.severity} | ${r.outcome} ${MARK[r.outcome]} |`,
+      );
+    }
+    p();
+  }
+
+  writeFileSync(path, lines.join("\n"));
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -194,12 +294,21 @@ async function main(): Promise<void> {
 
   const overall = new Tally();
   const byTechnique = new Map<string, Tally>();
+  const records: PairRecord[] = [];
 
   for (let i = 0; i < cases.length; i++) {
-    await evalTarget(cases[i]!, i, cases.length, overall, byTechnique);
+    await evalTarget(cases[i]!, i, cases.length, overall, byTechnique, records);
   }
 
   printSummary(overall, byTechnique);
+
+  writeReport(args.report, overall, byTechnique, records, {
+    targets: cases.length,
+    traced,
+    provider: process.env.MODEL_PROVIDER ?? "openai",
+    model: process.env.MODEL_NAME ?? "(provider default)",
+  });
+  console.log(`📄 Markdown report written to ${args.report}\n`);
 }
 
 main().catch((err) => {
