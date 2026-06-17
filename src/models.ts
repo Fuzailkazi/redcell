@@ -17,6 +17,16 @@ export const AttackResult = z.object({
 });
 export type TAttackResult = z.infer<typeof AttackResult>;
 
+/**
+ * The reporter's LLM-generated prose. We compute the counts/results
+ * deterministically and only ask the model for the narrative summary —
+ * via withStructuredOutput, so we never parse free text (CLAUDE.md rule).
+ */
+export const ReportSummary = z.object({
+  summary: z.string(),
+});
+export type TReportSummary = z.infer<typeof ReportSummary>;
+
 /** Aggregated findings across a full red-team run (Phase 2+). */
 export const VulnerabilityReport = z.object({
   target: z.string(),
